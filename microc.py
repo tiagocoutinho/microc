@@ -9,27 +9,18 @@ tar -xvf image.tar -C root/
 rm image.tar
 ```
 
+fork bomb
+:(){ :|:& };:
 """
 
 import ctypes.util
 import os
 import socket
+import subprocess
 import sys
 import time
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-
-def _init():
-    mount = libc.mount
-    mount.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_char_p,
-        ctypes.c_char_p,
-        ctypes.c_ulong,
-        ctypes.c_void_p,
-    ]
-    mount.restype = ctypes.c_int
 
 
 class out:
@@ -43,7 +34,7 @@ class out:
     @classmethod
     def pprint(cls, *args, **kwargs):
         pid, uid = os.getpid(), os.getuid()
-        cls.print(f"{pid:>6} {uid:>6}", *args, **kwargs)
+        cls.print(f"{pid:>7} {uid:>7}", *args, **kwargs)
 
     def __enter__(self):
         self.pprint(self.message, end="")
@@ -68,6 +59,12 @@ def mount(source, target, fs_type, flags=0, data=""):
         raise OSError(
             errno, f"Failed to mount {source} to {target}: {os.strerror(errno)}"
         )
+
+
+def umount(target):
+    if libc.umount2(target.encode(), 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"Failed to unmount {target}: {os.strerror(errno)}")
 
 
 def setuid(uid, host_uid, size=1):
@@ -95,8 +92,14 @@ def child(host_uid, host_gid):
         mount("proc", "proc", "proc")
     args = sys.argv[1:]
     out.pprint("[c] running", args)
-    # subprocess.run(args, check=True)
-    os.execvp(args[0], args)
+
+    # Hummm, I could use `os.execvp(args[0], args)` but then I cannot
+    # cleanup :-(
+    try:
+        subprocess.run(args, check=True)
+    finally:
+        with out("[c] unmounting proc"):
+            umount("proc")
     exit(0)
 
 
@@ -113,6 +116,7 @@ def run():
         _, status = os.waitpid(pid, 0)
         if status != 0:
             raise RuntimeError(f"Command failed with exit code: {status}")
+
     else:
         child(host_uid, host_gid)
 

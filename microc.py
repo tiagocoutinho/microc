@@ -15,6 +15,7 @@ fork bomb
 
 import ctypes.util
 import os
+import pathlib
 import socket
 import subprocess
 import sys
@@ -90,6 +91,8 @@ def child(host_uid, host_gid):
         os.chdir("/")
     with out("[c] mounting proc"):
         mount("proc", "proc", "proc")
+    with out("[c] preparing cgroups"):
+        cgroups()
     args = sys.argv[1:]
     out.pprint("[c] running", args)
 
@@ -101,6 +104,17 @@ def child(host_uid, host_gid):
         with out("[c] unmounting proc"):
             umount("proc")
     exit(0)
+
+
+def cgroups(name="microc"):
+    path = pathlib.Path("/sys/fs/cgroup") / name
+    path.mkdir(0o755, parents=True, exist_ok=True)
+    with (path / "pids.max").open("w") as maxp:
+        maxp.write("5")
+    with (path / "notify_on_release").open("w") as notif:
+        notif.write("1")
+    with (path / "cgroup.procs").open("w") as procs:
+        procs.write(str(os.getpid()))
 
 
 def run():

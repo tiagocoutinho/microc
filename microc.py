@@ -13,9 +13,9 @@ fork bomb
 :(){ :|:& };:
 """
 
+import contextlib
 import ctypes.util
 import os
-import pathlib
 import socket
 import subprocess
 import sys
@@ -68,6 +68,15 @@ def umount(target):
         raise OSError(errno, f"Failed to unmount {target}: {os.strerror(errno)}")
 
 
+@contextlib.contextmanager
+def mnt(source, target, fs_type, flags=0, data=""):
+    mount(source, target, fs_type, flags=0, data="")
+    try:
+        yield
+    finally:
+        umount(target)
+
+
 def setuid(uid, host_uid, size=1):
     with open("/proc/self/uid_map", "w") as f:
         f.write(f"{uid} {host_uid} {size}\n")
@@ -80,52 +89,39 @@ def setgid(gid, host_gid, size=1):
         f.write(f"{gid} {host_gid} {size}\n")
 
 
-def child(host_uid, host_gid):
-    with out("[c] preparing user"):
+def prepare(were, host_uid, host_gid):
+    with out(f"[{were}] preparing user"):
         setuid(0, host_uid)
         setgid(0, host_gid)
-    with out("[c] setting hostname"):
+    with out(f"[{were}] setting hostname"):
         socket.sethostname("bla")
-    with out("[c] changing root"):
+    with out(f"[{were}] changing root"):
         os.chroot("./root")
         os.chdir("/")
-    with out("[c] mounting proc"):
-        mount("proc", "proc", "proc")
-    with out("[c] preparing cgroups"):
-        cgroups()
+
+
+def child(host_uid, host_gid):
     args = sys.argv[1:]
-    out.pprint("[c] running", args)
-
-    # Hummm, I could use `os.execvp(args[0], args)` but then I cannot
-    # cleanup :-(
-    try:
+    prepare(" child", host_uid, host_gid)
+    with mnt("proc", "proc", "proc"):
+        out.pprint("[ child] running", args)
+        # Hummm, I could use `os.execvp(args[0], args)` but then I cannot
+        # cleanup :-(. But now the PID is going to be 2 instead of 1
         subprocess.run(args, check=True)
-    finally:
-        with out("[c] unmounting proc"):
-            umount("proc")
     exit(0)
-
-
-def cgroups(name="microc"):
-    path = pathlib.Path("/sys/fs/cgroup") / name
-    path.mkdir(0o755, parents=True, exist_ok=True)
-    with (path / "pids.max").open("w") as maxp:
-        maxp.write("5")
-    with (path / "notify_on_release").open("w") as notif:
-        notif.write("1")
-    with (path / "cgroup.procs").open("w") as procs:
-        procs.write(str(os.getpid()))
 
 
 def run():
     """Run a command in a new namespace."""
+    print("    PID     UID  process Message")
     host_uid = os.getuid()
     host_gid = os.getgid()
-    with out("[p] preparing namespaces"):
+    with out("[parent] preparing namespaces"):
         os.unshare(
             os.CLONE_NEWUSER | os.CLONE_NEWPID | os.CLONE_NEWNS | os.CLONE_NEWUTS
         )
-    out.pprint(f"{'[p] forking and waiting for child':.<50}[WAIT]")
+    #prepare("parent", host_uid, host_gid)
+    out.pprint(f"{'[parent] forking and waiting for child':.<50}[WAIT]")
     if pid := os.fork():
         _, status = os.waitpid(pid, 0)
         if status != 0:

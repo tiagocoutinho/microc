@@ -100,8 +100,7 @@ def prepare(were, host_uid, host_gid):
         os.chdir("/")
 
 
-def child(host_uid, host_gid):
-    args = sys.argv[1:]
+def child(args, host_uid, host_gid):
     prepare(" child", host_uid, host_gid)
     with mnt("proc", "proc", "proc"):
         out.pprint("[ child] running", args)
@@ -128,7 +127,7 @@ def run():
             raise RuntimeError(f"Command failed with exit code: {status}")
 
     else:
-        child(host_uid, host_gid)
+        child(sys.argv[1:], host_uid, host_gid)
 
 
 run()

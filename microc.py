@@ -19,7 +19,6 @@ import time
 start = time.monotonic()
 
 import ctypes.util
-import enum
 import os
 import pathlib
 import socket
@@ -27,8 +26,6 @@ import sys
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-
-# Mount tools ----------------------------------------------------------------
 
 def mount(source, target, fs_type, flags=0, data=""):
     if (
@@ -43,49 +40,8 @@ def mount(source, target, fs_type, flags=0, data=""):
         )
 
 
-# Capabilities ---------------------------------------------------------------
-
-# Capability version used by modern kernels
-_LINUX_CAPABILITY_VERSION_3 = 0x20080522
-_LINUX_CAPABILITY_U32S_3 = 2
-CAP_SYS_ADMIN = 21
-
-
-class CapUserHeader(ctypes.Structure):
-    _fields_ = [
-        ("version", ctypes.c_uint32),
-        ("pid", ctypes.c_int),
-    ]
-
-
-class CapUserData(ctypes.Structure):
-    _fields_ = [
-        ("effective", ctypes.c_uint32),
-        ("permitted", ctypes.c_uint32),
-        ("inheritable", ctypes.c_uint32),
-    ]
-
-
-def capget(pid: int = 0):
-    header = CapUserHeader(version=_LINUX_CAPABILITY_VERSION_3, pid=pid)
-    data = (
-        CapUserData * _LINUX_CAPABILITY_U32S_3
-    )()  # two 32-bit words for 64-bit caps
-
-    ret = libc.capget(ctypes.byref(header), ctypes.byref(data))
-    if ret != 0:
-        raise OSError(ctypes.get_errno(), "capget failed")
-    return {
-        "effective": data[0].effective | (data[1].effective << 32),
-        "permitted": data[0].permitted | (data[1].permitted << 32),
-        "inheritable": data[0].inheritable | (data[1].inheritable << 32),
-    }
-
-
-# Print tools ----------------------------------------------------------------
-
 class out:
-    prefix = '[parent]'
+    prefix = "[parent]"
 
     def __init__(self, message):
         self.message = f"{message:.<50}"
@@ -98,7 +54,9 @@ class out:
     def pprint(cls, *args, **kwargs):
         ts = time.monotonic() - start
         pid, uid, gid = os.getpid(), os.getuid(), os.getgid()
-        cls.print(f"{ts:10.6f} {pid:>7} {uid:>7}:{gid:<7} {cls.prefix} ", *args, **kwargs)
+        cls.print(
+            f"{ts:10.6f} {pid:>7} {uid:>7}:{gid:<7} {cls.prefix} ", *args, **kwargs
+        )
 
     def __enter__(self):
         self.pprint(self.message, end="")
@@ -109,10 +67,7 @@ class out:
         if exc_value is None:
             self.print(f"[DONE] (took {dt_ms:.1f}us)")
         else:
-            self.print(f"[ ERR] (took {dt_ms:.1f}us) {exc_value!r}")
-
-
-# Core -----------------------------------------------------------------------
+            self.print(f"[ ERR] (took {dt_ms:.1f}us) {exc_value}")
 
 
 def setuid(uid, host_uid, size=1):
@@ -127,45 +82,54 @@ def setgid(gid, host_gid, size=1):
         f.write(f"{gid} {host_gid} {size}\n")
 
 
-def prepare(host_uid, host_gid, opts):
+def prepare(host_uid, host_gid, config):
     with out(f"preparing user"):
-        setuid(opts.user, host_uid)
-        setgid(opts.group, host_gid)
-    if host := opts.host:
-        with out(f"setting hostname"):
+        if (uid := config["user"]) is not None:
+            setuid(uid, host_uid)
+        if (gid := config["group"]) is not None:
+            setgid(gid, host_gid)
+    if host := config["host"]:
+        with out(f"setting hostname to {host}"):
             socket.sethostname(host)
-    if root := opts.root:
+    if root := config["root"]:
         with out(f"changing root"):
             os.chroot(root)
-    if pwd := opts.pwd:
+    if pwd := config["pwd"]:
         os.chdir(pwd)
     elif root:
         os.chdir("/")
 
 
-def child(host_uid, host_gid, opts):
-    args = opts.args
-    prepare(host_uid, host_gid, opts)
-    if opts.mount:
+def child(host_uid, host_gid, config):
+    command = config["command"]
+    prepare(host_uid, host_gid, config)
+    if config["mount"]:
         with out("mounting /proc"):
-            mount("proc", "/proc", "proc", 1 | 4 | 8) # 1 = READONLY; 4 = NODEV; 8 = NOEXEC
-    out.pprint(
-        "running",
-    )
-    # Hummm, I could use `os.execvp(args[0], args)` but then I cannot
-    # cleanup :-(. But now the PID is going to be 2 instead of 1
-    # subprocess.run(args, check=True)
-    os.execvpe(args[0], args, {})
+            mount(
+                "proc", "/proc", "proc", 1 | 4 | 8
+            )  # 1 = READONLY; 4 = NODEV; 8 = NOEXEC
+    out.pprint(f"running {' '.join(command)!r}")
+    if config["envmode"] == "replace":
+        env = config["env"]
+    else:
+        env = os.environ | config["env"]
+    os.execvpe(command[0], command, env)
 
 
-def run(opts):
+def run(config):
     """Run a command in a new namespace."""
     print(" Timestamp     PID     UID:GID      Process Message")
     host_uid = os.getuid()
     host_gid = os.getgid()
-    flags = os.CLONE_NEWUSER | os.CLONE_NEWPID | os.CLONE_NEWUTS
-    if opts.mount:
-        flags |= os.CLONE_NEWNS
+    flags = os.CLONE_NEWUTS | os.CLONE_NEWUSER
+    if config["user"] is None:
+        config["user"] = host_gid
+    if config["group"] is None:
+        config["group"] = host_gid
+    if config["mount"]:
+        flags |= os.CLONE_NEWNS | os.CLONE_NEWPID
+    if config["pid1"]:
+        flags |= os.CLONE_NEWPID
     with out("preparing namespaces"):
         os.unshare(flags)
     out.pprint(f"{'forking and waiting for child':.<50}[WAIT]")
@@ -179,22 +143,37 @@ def run(opts):
         out.pprint(msg)
     else:
         out.prefix = "[ child]"
-        child(host_uid, host_gid, opts)
+        try:
+            child(host_uid, host_gid, config)
+        except Exception as error:
+            out.pprint(f"failed to run: {error}")
+            sys.exit(1)
 
 
 def main(args=None):
     import argparse
 
+    Bool = argparse.BooleanOptionalAction
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=pathlib.Path, default=None)
-    parser.add_argument("--user", type=int, default=0)
-    parser.add_argument("--group", type=int, default=0)
+    parser.add_argument("--user", type=int, default=None)
+    parser.add_argument("--group", type=int, default=None)
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--pwd", type=str, default=None)
-    parser.add_argument("--mount", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("args", nargs="+")
+    parser.add_argument("--mount", action=Bool, default=True)
+    parser.add_argument("--pid1", action=Bool, default=True)
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--envmode", choices=["append", "replace"], default="replace")
+    parser.add_argument("command", nargs="+")
     opts = parser.parse_args(args=args)
-    run(opts)
+    config = vars(opts)
+    config.setdefault("env", {})
+    if fname := config.pop("config"):
+        import tomllib
+
+        with open(fname, "rb") as f:
+            config |= tomllib.load(f)
+    run(config)
 
 
 if __name__ == "__main__":

@@ -1,19 +1,3 @@
-"""
-Prepare a docker image for chroot:
-
-```shell
-docker create --name py313-slim python:3.13-slim
-docker export py313-slim -o py313-slim.tar
-docker rm py313-slim
-mkdir root
-tar -xvf py313-slim.tar -C root/
-rm py313-slim.tar
-```
-
-fork bomb
-:(){ :|:& };:
-"""
-
 import time
 
 start = time.monotonic()
@@ -127,7 +111,7 @@ def run(config):
     if config["group"] is None:
         config["group"] = host_gid
     if config["mount"]:
-        flags |= os.CLONE_NEWNS | os.CLONE_NEWPID
+        flags |= os.CLONE_NEWNS
     if config["pid1"]:
         flags |= os.CLONE_NEWPID
     with out("preparing namespaces"):
@@ -173,6 +157,8 @@ def main(args=None):
 
         with open(fname, "rb") as f:
             config |= tomllib.load(f)
+    if config["mount"] and not config["pid1"]:
+        parser.error("mount needs pid1")
     run(config)
 
 

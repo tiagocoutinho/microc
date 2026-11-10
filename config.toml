@@ -1,6 +1,6 @@
-root = "./root"
-pid1 = false
+root = "./py314-alpine"
 pwd = "/"
+user = 1
 
 [env]
 TERM = "xterm"

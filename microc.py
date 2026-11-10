@@ -11,17 +11,15 @@ import sys
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 
-def mount(source, target, fs_type, flags=0, data=""):
-    if (
-        libc.mount(
-            source.encode(), target.encode(), fs_type.encode(), flags, data.encode()
-        )
-        == -1
-    ):
-        errno = ctypes.get_errno()
-        raise OSError(
-            errno, f"Failed to mount {source} to {target}: {os.strerror(errno)}"
-        )
+def _check(ret: int, msg: str) -> None:
+    if ret < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"{msg}: {os.strerror(e)}")
+
+
+def mount(source, target, fs_type, flags=0, data=None):
+    ret = libc.mount(source, target, fs_type, flags, data)
+    _check(ret, f"Failed to mount {target}")
 
 
 class out:
@@ -89,9 +87,8 @@ def child(host_uid, host_gid, config):
     prepare(host_uid, host_gid, config)
     if config["mount"]:
         with out("mounting /proc"):
-            mount(
-                "proc", "/proc", "proc", 1 | 4 | 8
-            )  # 1 = READONLY; 4 = NODEV; 8 = NOEXEC
+            # 1 = READONLY; 4 = NODEV; 8 = NOEXEC
+            mount(None, b"/proc", b"proc", 1 | 4 | 8)
     out.pprint(f"running {' '.join(command)!r}")
     if config["envmode"] == "replace":
         env = config["env"]

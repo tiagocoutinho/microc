@@ -75,8 +75,17 @@ def _log_prefix() -> str:
     elapsed = time.perf_counter() - _PROCESS_T0
     uid, gid, pid = os.getuid(), os.getgid(), os.getpid()
     # Right-align uid so "uid:gid" reads as one unit (e.g. " 1000:1000")
-    return f"[{elapsed:8.4f}s {uid:>5d}:{gid:<5d} {pid:<6d}] "
+    return f"[{elapsed:8.4f}s {uid:>5d}:{gid:<5d} {pid:>7d}] "
 
+
+def eprint(*args, **kwargs):
+    kwargs.setdefault("sep", "")
+    kwargs.setdefault("file", sys.stderr)
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+def elprint(*args, **kwargs):
+    eprint(_log_prefix(), *args, **kwargs)
 
 class step:
     """
@@ -87,15 +96,20 @@ class step:
 
         [  0.0012s     0:0      12345 ] → prepare cgroup.... [OK] (812 µs)
         [  0.0020s  1000:1000   12346 ] → unshare namespaces [OK] (45 µs)
+
+    hold_line=False: print the start with a newline so concurrent child
+    logs (e.g. during create_subprocess_exec) do not share the same line;
+    the result is then a separate full line.
     """
 
     # Column where " [OK]" / " [ERROR]" begins (width of the left part
     # after the timestamp/pid prefix)
     WIDTH = 56
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, hold_line: bool = True):
         self.name = name
-        self.t0 = 0.0
+        self.hold_line = hold_line
+        self._left = ""
 
     def __enter__(self) -> "step":
         self.t0 = time.perf_counter()
@@ -103,18 +117,29 @@ class step:
         pad = self.WIDTH - len(head)
         if pad < 1:
             pad = 1
-        print(_log_prefix() + head + ("." * pad),
-              file=sys.stderr, end="", flush=True)
+        self._left = head + ("." * pad)
+        if self.hold_line:
+            elprint(self._left, end="")
+        else:
+            # Close the line immediately so child preexec logs stay clean
+            elprint(self._left, " ...")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         us = int((time.perf_counter() - self.t0) * 1_000_000)
-        if exc_type is None:
-            print(f" [OK] ({us} µs)", file=sys.stderr, flush=True)
+        if self.hold_line:
+            if exc_type is None:
+                eprint(f" [OK] ({us} µs)")
+            else:
+                err = exc if exc is not None else exc_type
+                eprint(f" [ERROR] ({us} µs): {err}")
         else:
-            err = exc if exc is not None else exc_type
-            print(f" [ERROR] ({us} µs): {err}", file=sys.stderr, flush=True)
-        return False  # never suppress exceptions
+            # Result on its own line (same columns as a normal step)
+            if exc_type is None:
+                elprint(self._left, f" [OK] ({us} µs)")
+            else:
+                err = exc if exc is not None else exc_type
+                elprint(self._left, f" [ERROR] ({us} µs): {err}")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +153,8 @@ MS_REC = 0x4000
 MS_PRIVATE = 0x40000
 MS_RDONLY = 0x1
 MNT_DETACH = 0x2
+MS_NODEV = 0x4
+MS_NOEXEC = 0x8
 
 CLONE_NEWNS = getattr(os, "CLONE_NEWNS", 0x00020000)
 CLONE_NEWUTS = getattr(os, "CLONE_NEWUTS", 0x04000000)
@@ -239,9 +266,91 @@ def status_to_exitcode(status: int) -> int:
     return 1
 
 
-# ---------------------------------------------------------------------------
-# Isolator
-# ---------------------------------------------------------------------------
+def setup_user_mapping(
+    *,
+    map_root: bool,
+    uid: int,
+    gid: int,
+    uid_map: Optional[str],
+    gid_map: Optional[str],
+) -> None:
+    try:
+        with open("/proc/self/setgroups", "w") as f:
+            f.write("deny\n")
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+
+    umap, gmap = f"0 {uid} 1", f"0 {gid} 1"
+    if not map_root:
+        if uid_map:
+            umap = uid_map.replace(":", " ")
+        if gid_map:
+            gmap = gid_map.replace(":", " ")
+
+    try:
+        with open("/proc/self/uid_map", "w") as f:
+            f.write(umap + "\n")
+    except OSError as e:
+        eprint(f"warning: could not write user maps ", umap, ": ", e)
+    try:
+        with open("/proc/self/gid_map", "w") as f:
+            f.write(gmap + "\n")
+    except OSError as e:
+        eprint(f"warning: could not write group maps ", gmap, ": ", e)
+
+
+def setup_container_network(
+    *,
+    net: str,
+    veth_cont: Optional[str],
+    ip: Optional[str],
+    gateway: Optional[str],
+) -> None:
+    try:
+        run_ip("link", "set", "lo", "up")
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    if net != "bridge" or not veth_cont:
+        return
+
+    for _ in range(40):
+        r = run_ip("link", "show", veth_cont, check=False)
+        if r.returncode == 0:
+            break
+        time.sleep(0.025)
+    else:
+        eprint("warning: container veth ", veth_cont ," not visible")
+        return
+
+    try:
+        run_ip("link", "set", veth_cont, "name", "eth0")
+        run_ip("link", "set", "eth0", "up")
+        if ip:
+            run_ip("addr", "add", ip, "dev", "eth0")
+        if gateway:
+            run_ip("route", "add", "default", "via", gateway, check=False)
+    except subprocess.CalledProcessError as e:
+        eprint("warning: container network setup failed: ", e)
+
+
+def mount_proc() -> None:
+    try:
+        os.makedirs("/proc", exist_ok=True)
+        mount("proc", "/proc", "proc", 1 | 4 | 8)
+    except OSError as e:
+        eprint("warning: could not mount /proc: ", e)
+
+
+def enter_rootfs(rootfs: str) -> None:
+    root = Path(rootfs)
+    if not root.is_dir():
+        eprint(f"rootfs is not a directory: ", rootfs)
+        os._exit(1)
+
+    os.chroot(str(root))
+    os.chdir("/")
+    mount_proc()
 
 class Isolator:
     def __init__(
@@ -293,6 +402,9 @@ class Isolator:
         self.cpu_quota = cpu_quota
         self.cgroup_parent = cgroup_parent
 
+        self._uid = os.getuid()
+        self._gid = os.getgid()
+
         self._cgroup_path: Optional[Path] = None
         self._veth_host: Optional[str] = None
         self._veth_cont: Optional[str] = None
@@ -303,7 +415,7 @@ class Isolator:
 
     def run(self) -> int:
         if not sys.platform.startswith("linux"):
-            print("This tool only works on Linux (namespaces).", file=sys.stderr)
+            eprint("This tool only works on Linux (namespaces).")
             return 1
         return asyncio.run(self._run_async())
 
@@ -352,7 +464,9 @@ class Isolator:
             self._preexec_fn(cfg)
 
         try:
-            with step(f"create_subprocess_exec {self.command!r}"):
+            # hold_line=False: child preexec logs must not share this line
+            with step(f"create_subprocess_exec {self.command!r}",
+                      hold_line=False):
                 proc = await asyncio.create_subprocess_exec(
                     *self.command,
                     preexec_fn=preexec,
@@ -360,8 +474,7 @@ class Isolator:
                     start_new_session=True,
                 )
         except OSError as e:
-            print(f"  [ERROR] create_subprocess_exec: {e}", file=sys.stderr,
-                  flush=True)
+            eprint("  [ERROR] create_subprocess_exec: ", e)
             self._cleanup_network()
             self._cleanup_cgroup()
             return 1
@@ -385,8 +498,7 @@ class Isolator:
                         None, os.read, sync_unshared_r, 1
                     )
                 except OSError as e:
-                    print(f"  [ERROR] reading unshare signal: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint("  [ERROR] reading unshare signal: ", e)
                 finally:
                     try:
                         os.close(sync_unshared_r)
@@ -399,8 +511,7 @@ class Isolator:
                         run_ip("link", "set", self._veth_cont, "netns",
                                str(proc.pid))
                     except subprocess.CalledProcessError as e:
-                        print(f"  [ERROR] move veth: {e}", file=sys.stderr,
-                              flush=True)
+                        eprint("  [ERROR] move veth: ", e)
                         raise
 
             if self._veth_host:
@@ -410,16 +521,14 @@ class Isolator:
                                self.bridge)
                         run_ip("link", "set", self._veth_host, "up")
                     except subprocess.CalledProcessError as e:
-                        print(f"  [ERROR] attach veth to bridge: {e}",
-                              file=sys.stderr, flush=True)
+                        eprint("  [ERROR] attach veth to bridge: ", e)
                         raise
 
             with step("signal child that veth is ready"):
                 try:
                     os.write(sync_ready_w, b"1")
                 except OSError as e:
-                    print(f"  [ERROR] writing ready signal: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint("  [ERROR] writing ready signal: ", e)
                 finally:
                     try:
                         os.close(sync_ready_w)
@@ -476,6 +585,8 @@ class Isolator:
             "cgroup_path": str(self._cgroup_path) if self._cgroup_path else None,
             "unshared_w": unshared_w,
             "ready_r": ready_r,
+            "uid": self._uid,
+            "gid": self._gid,
         }
 
     # ------------------------------------------------------------------
@@ -491,7 +602,7 @@ class Isolator:
             try:
                 os.unshare(flags)
             except OSError as e:
-                print(f"unshare failed: {e}", file=sys.stderr, flush=True)
+                eprint(f"unshare failed: ", e)
                 os._exit(1)
 
         # PID namespace: only a child of the unsharing process is PID 1
@@ -513,8 +624,7 @@ class Isolator:
                 try:
                     os.write(unshared_w, b"1")
                 except OSError as e:
-                    print(f"  [ERROR] unshare signal write: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint(f"  [ERROR] unshare signal write: ", e)
                 try:
                     os.close(unshared_w)
                 except OSError:
@@ -526,8 +636,7 @@ class Isolator:
                 try:
                     os.read(ready_r, 1)
                 except OSError as e:
-                    print(f"  [ERROR] ready signal read: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint(f"  [ERROR] ready signal read: ", e)
                 try:
                     os.close(ready_r)
                 except OSError:
@@ -536,8 +645,10 @@ class Isolator:
         # User mapping (must be early while we can still write the maps)
         if cfg["enable_user"]:
             with step("setup user/group ID mapping"):
-                self._setup_user_mapping_static(
+                setup_user_mapping(
                     map_root=cfg["map_root"],
+                    uid=cfg["uid"],
+                    gid=cfg["gid"],
                     uid_map=cfg["uid_map"],
                     gid_map=cfg["gid_map"],
                 )
@@ -556,14 +667,13 @@ class Isolator:
                 try:
                     sethostname(cfg["hostname"])
                 except OSError as e:
-                    print(f"warning: could not set hostname: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint(f"warning: could not set hostname: ", e)
                     raise
 
         # Network inside the netns
         if cfg["enable_net"]:
             with step("setup container network (lo / eth0 / routes)"):
-                self._setup_container_network_static(
+                setup_container_network(
                     net=cfg["net"],
                     veth_cont=cfg["veth_cont"],
                     ip=cfg["ip"],
@@ -573,18 +683,17 @@ class Isolator:
         # Rootfs / proc
         if cfg["rootfs"]:
             with step(f"enter rootfs {cfg['rootfs']!r}"):
-                self._enter_rootfs_static(cfg["rootfs"])
+                enter_rootfs(cfg["rootfs"])
         elif cfg["enable_mount"]:
             with step("mount /proc"):
-                self._mount_proc_static()
+                mount_proc()
 
         if cfg["workdir"]:
             with step(f"chdir to {cfg['workdir']!r}"):
                 try:
                     os.chdir(cfg["workdir"])
                 except OSError as e:
-                    print(f"warning: cannot chdir to {cfg['workdir']}: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint("warning: cannot chdir to ", cfg['workdir'], ": ", e)
                     raise
 
         # Join cgroup
@@ -595,8 +704,7 @@ class Isolator:
                         str(os.getpid()) + "\n"
                     )
                 except OSError as e:
-                    print(f"warning: could not join cgroup: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint("warning: could not join cgroup: ", e)
                     raise
 
         # Optional: stay as reaper (PID 1), let the user command be a child
@@ -607,8 +715,7 @@ class Isolator:
             return
 
         # Returning from preexec_fn → kernel execs self.command in this process
-        print(f"{_log_prefix()}→ exec target command (returning from preexec_fn)...",
-              file=sys.stderr, flush=True)
+        elprint("→ exec target command (returning from preexec_fn)...")
 
     def _become_reaper_then_return(self) -> None:
         """
@@ -668,113 +775,7 @@ class Isolator:
     # Static helpers usable from preexec (no self mutation)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _setup_user_mapping_static(
-        *,
-        map_root: bool,
-        uid_map: Optional[str],
-        gid_map: Optional[str],
-    ) -> None:
-        try:
-            with open("/proc/self/setgroups", "w") as f:
-                f.write("deny\n")
-        except (FileNotFoundError, PermissionError, OSError):
-            pass
 
-        uid, gid = os.getuid(), os.getgid()
-        if map_root:
-            umap, gmap = f"0 {uid} 1", f"0 {gid} 1"
-        else:
-            umap = uid_map or f"0 {uid} 1"
-            gmap = gid_map or f"0 {gid} 1"
-
-        try:
-            with open("/proc/self/uid_map", "w") as f:
-                f.write(umap + "\n")
-            with open("/proc/self/gid_map", "w") as f:
-                f.write(gmap + "\n")
-        except OSError as e:
-            print(f"warning: could not write user maps: {e}", file=sys.stderr)
-
-    @staticmethod
-    def _setup_container_network_static(
-        *,
-        net: str,
-        veth_cont: Optional[str],
-        ip: Optional[str],
-        gateway: Optional[str],
-    ) -> None:
-        try:
-            run_ip("link", "set", "lo", "up")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-
-        if net != "bridge" or not veth_cont:
-            return
-
-        for _ in range(40):
-            r = run_ip("link", "show", veth_cont, check=False)
-            if r.returncode == 0:
-                break
-            time.sleep(0.025)
-        else:
-            print(f"warning: container veth {veth_cont} not visible",
-                  file=sys.stderr)
-            return
-
-        try:
-            run_ip("link", "set", veth_cont, "name", "eth0")
-            run_ip("link", "set", "eth0", "up")
-            if ip:
-                run_ip("addr", "add", ip, "dev", "eth0")
-            if gateway:
-                run_ip("route", "add", "default", "via", gateway, check=False)
-        except subprocess.CalledProcessError as e:
-            print(f"warning: container network setup failed: {e}",
-                  file=sys.stderr)
-
-    @staticmethod
-    def _mount_proc_static() -> None:
-        try:
-            os.makedirs("/proc", exist_ok=True)
-            mount("proc", "/proc", "proc", 0)
-        except OSError as e:
-            print(f"warning: could not mount /proc: {e}", file=sys.stderr)
-
-    @staticmethod
-    def _enter_rootfs_static(rootfs: str) -> None:
-        root = Path(rootfs)
-        if not root.is_dir():
-            print(f"rootfs is not a directory: {rootfs}", file=sys.stderr)
-            os._exit(1)
-
-        old_root = root / "old_root"
-        try:
-            old_root.mkdir(exist_ok=True)
-        except OSError:
-            os.chroot(str(root))
-            os.chdir("/")
-            Isolator._mount_proc_static()
-            return
-
-        try:
-            mount(str(root), str(root), "", MS_BIND | MS_REC)
-            pivot_root(str(root), str(old_root))
-            os.chdir("/")
-            try:
-                umount("/old_root", MNT_DETACH)
-                os.rmdir("/old_root")
-            except OSError:
-                pass
-        except OSError:
-            os.chroot(str(root))
-            os.chdir("/")
-
-        Isolator._mount_proc_static()
-        try:
-            os.makedirs("/dev", exist_ok=True)
-        except OSError:
-            pass
 
     # ------------------------------------------------------------------
     # Host-side network + cgroup
@@ -802,7 +803,7 @@ class Isolator:
             )
             run_ip("link", "set", self._veth_host, "up", check=False)
         except subprocess.CalledProcessError as e:
-            print(f"error preparing host network: {e}", file=sys.stderr)
+            eprint(f"error preparing host network: ", e)
             raise
 
     def _cleanup_network(self) -> None:
@@ -819,8 +820,7 @@ class Isolator:
         try:
             base = Path(self.cgroup_parent)
             if not (base / "cgroup.controllers").exists():
-                print("warning: cgroup v2 hierarchy not found, "
-                      "resource limits disabled", file=sys.stderr)
+                eprint("warning: cgroup v2 hierarchy not found, resource limits disabled")
                 return
 
             isolate_base = base / "isolate"
@@ -855,8 +855,7 @@ class Isolator:
                         parse_size(self.memory_limit) + "\n"
                     )
                 except (ValueError, OSError) as e:
-                    print(f"warning: could not set memory.max: {e}",
-                          file=sys.stderr)
+                    eprint(f"warning: could not set memory.max:", e)
 
             if self.memory_swap:
                 try:
@@ -866,8 +865,7 @@ class Isolator:
                             parse_size(self.memory_swap) + "\n"
                         )
                 except (ValueError, OSError) as e:
-                    print(f"warning: could not set memory.swap.max: {e}",
-                          file=sys.stderr)
+                    eprint("warning: could not set memory.swap.max: ", e)
 
             if self.cpu_quota:
                 try:
@@ -875,11 +873,10 @@ class Isolator:
                         parse_cpu_quota(self.cpu_quota) + "\n"
                     )
                 except (ValueError, OSError) as e:
-                    print(f"warning: could not set cpu.max: {e}",
-                          file=sys.stderr)
+                    eprint("warning: could not set cpu.max: ", e)
 
         except OSError as e:
-            print(f"warning: cgroup setup failed: {e}", file=sys.stderr)
+            eprint(f"warning: cgroup setup failed: ", e)
             self._cgroup_path = None
 
     def _cleanup_cgroup(self) -> None:

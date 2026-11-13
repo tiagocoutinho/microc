@@ -66,18 +66,31 @@ from typing import List, Optional
 # Step logging (stderr, print only — no logging module)
 # ---------------------------------------------------------------------------
 
+# Monotonic origin for relative timestamps (process start ≈ import time)
+_PROCESS_T0 = time.perf_counter()
+
+
+def _log_prefix() -> str:
+    """Relative timestamp + uid:gid + pid of the process that is printing."""
+    elapsed = time.perf_counter() - _PROCESS_T0
+    uid, gid, pid = os.getuid(), os.getgid(), os.getpid()
+    # Right-align uid so "uid:gid" reads as one unit (e.g. " 1000:1000")
+    return f"[{elapsed:8.4f}s {uid:>5d}:{gid:<5d} {pid:<6d}] "
+
+
 class step:
     """
     Context manager that logs a step on a single stderr line.
-    The start text is padded with '.' so every result marker begins
-    at the same column:
+    Each line is prepended with relative time since process start,
+    uid:gid, and pid.  The start text is padded with '.' so every
+    result marker begins at the same column:
 
-        → prepare cgroup........................ [OK] (812 µs)
-        → unshare namespaces (flags=0x6c020000). [OK] (45 µs)
-        → setup user/group ID mapping........... [ERROR] (12 µs): ...
+        [  0.0012s     0:0      12345 ] → prepare cgroup.... [OK] (812 µs)
+        [  0.0020s  1000:1000   12346 ] → unshare namespaces [OK] (45 µs)
     """
 
-    # Column where " [OK]" / " [ERROR]" begins (width of the left part)
+    # Column where " [OK]" / " [ERROR]" begins (width of the left part
+    # after the timestamp/pid prefix)
     WIDTH = 56
 
     def __init__(self, name: str):
@@ -87,11 +100,11 @@ class step:
     def __enter__(self) -> "step":
         self.t0 = time.perf_counter()
         head = f"→ {self.name} "
-        # Pad with dots up to WIDTH; always at least one '.'
         pad = self.WIDTH - len(head)
         if pad < 1:
             pad = 1
-        print(head + ("." * pad), file=sys.stderr, end="", flush=True)
+        print(_log_prefix() + head + ("." * pad),
+              file=sys.stderr, end="", flush=True)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -594,7 +607,7 @@ class Isolator:
             return
 
         # Returning from preexec_fn → kernel execs self.command in this process
-        print("→ exec target command (returning from preexec_fn)...",
+        print(f"{_log_prefix()}→ exec target command (returning from preexec_fn)...",
               file=sys.stderr, flush=True)
 
     def _become_reaper_then_return(self) -> None:

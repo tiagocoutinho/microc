@@ -63,6 +63,36 @@ from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
+# Step logging (stderr, print only — no logging module)
+# ---------------------------------------------------------------------------
+
+class step:
+    """
+    Context manager that logs the start of a step and then [OK]/[ERROR]
+    with elapsed time in microseconds.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.t0 = 0.0
+
+    def __enter__(self) -> "step":
+        self.t0 = time.perf_counter()
+        print(f"→ {self.name}...", file=sys.stderr, flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        us = int((time.perf_counter() - self.t0) * 1_000_000)
+        if exc_type is None:
+            print(f"  [OK] {self.name} ({us} µs)", file=sys.stderr, flush=True)
+        else:
+            err = exc if exc is not None else exc_type
+            print(f"  [ERROR] {self.name} ({us} µs): {err}",
+                  file=sys.stderr, flush=True)
+        return False  # never suppress exceptions
+
+
+# ---------------------------------------------------------------------------
 # Low-level helpers (libc)
 # ---------------------------------------------------------------------------
 
@@ -253,10 +283,12 @@ class Isolator:
         return asyncio.run(self._run_async())
 
     async def _run_async(self) -> int:
-        self._prepare_cgroup()
+        with step("prepare cgroup"):
+            self._prepare_cgroup()
 
         if self.net == "bridge" and self.enable_net:
-            self._prepare_host_network()
+            with step("prepare host network (veth + bridge)"):
+                self._prepare_host_network()
 
         # Sync pipes for bridge mode: child → parent "unshared", parent → child "ready"
         sync_unshared_r = sync_unshared_w = None
@@ -264,12 +296,12 @@ class Isolator:
         pass_fds: List[int] = []
 
         if self.net == "bridge" and self.enable_net:
-            sync_unshared_r, sync_unshared_w = os.pipe()
-            sync_ready_r, sync_ready_w = os.pipe()
-            # Child keeps write end of unshared + read end of ready
-            pass_fds = [sync_unshared_w, sync_ready_r]
-            os.set_inheritable(sync_unshared_w, True)
-            os.set_inheritable(sync_ready_r, True)
+            with step("create sync pipes for bridge handoff"):
+                sync_unshared_r, sync_unshared_w = os.pipe()
+                sync_ready_r, sync_ready_w = os.pipe()
+                pass_fds = [sync_unshared_w, sync_ready_r]
+                os.set_inheritable(sync_unshared_w, True)
+                os.set_inheritable(sync_ready_r, True)
 
         flags = 0
         if self.enable_mount:
@@ -285,7 +317,6 @@ class Isolator:
         if self.enable_net:
             flags |= CLONE_NEWNET
 
-        # Capture config for the preexec closure (must be picklable / simple)
         cfg = self._preexec_config(
             flags=flags,
             unshared_w=sync_unshared_w,
@@ -296,19 +327,20 @@ class Isolator:
             self._preexec_fn(cfg)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *self.command,
-                preexec_fn=preexec,
-                pass_fds=tuple(pass_fds) if pass_fds else (),
-                start_new_session=True,
-            )
+            with step(f"create_subprocess_exec {self.command!r}"):
+                proc = await asyncio.create_subprocess_exec(
+                    *self.command,
+                    preexec_fn=preexec,
+                    pass_fds=tuple(pass_fds) if pass_fds else (),
+                    start_new_session=True,
+                )
         except OSError as e:
-            print(f"failed to start process: {e}", file=sys.stderr)
+            print(f"  [ERROR] create_subprocess_exec: {e}", file=sys.stderr,
+                  flush=True)
             self._cleanup_network()
             self._cleanup_cgroup()
             return 1
         finally:
-            # Parent closes the ends it does not need
             if sync_unshared_w is not None:
                 try:
                     os.close(sync_unshared_w)
@@ -322,43 +354,52 @@ class Isolator:
 
         # Bridge: wait for child to enter netns, move veth, signal ready
         if self.net == "bridge" and self.enable_net and proc.pid:
-            try:
-                # Block until child signals unshare done
-                await asyncio.get_event_loop().run_in_executor(
-                    None, os.read, sync_unshared_r, 1
-                )
-            except OSError:
-                pass
-            finally:
+            with step("wait for child netns unshare signal"):
                 try:
-                    os.close(sync_unshared_r)
-                except OSError:
-                    pass
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, os.read, sync_unshared_r, 1
+                    )
+                except OSError as e:
+                    print(f"  [ERROR] reading unshare signal: {e}",
+                          file=sys.stderr, flush=True)
+                finally:
+                    try:
+                        os.close(sync_unshared_r)
+                    except OSError:
+                        pass
 
             if self._veth_cont:
-                try:
-                    run_ip("link", "set", self._veth_cont, "netns", str(proc.pid))
-                except subprocess.CalledProcessError as e:
-                    print(f"warning: could not move veth into netns: {e}",
-                          file=sys.stderr)
+                with step(f"move {self._veth_cont} into netns of pid {proc.pid}"):
+                    try:
+                        run_ip("link", "set", self._veth_cont, "netns",
+                               str(proc.pid))
+                    except subprocess.CalledProcessError as e:
+                        print(f"  [ERROR] move veth: {e}", file=sys.stderr,
+                              flush=True)
+                        raise
 
             if self._veth_host:
-                try:
-                    run_ip("link", "set", self._veth_host, "master", self.bridge)
-                    run_ip("link", "set", self._veth_host, "up")
-                except subprocess.CalledProcessError as e:
-                    print(f"warning: could not attach veth to bridge: {e}",
-                          file=sys.stderr)
+                with step(f"attach {self._veth_host} to bridge {self.bridge}"):
+                    try:
+                        run_ip("link", "set", self._veth_host, "master",
+                               self.bridge)
+                        run_ip("link", "set", self._veth_host, "up")
+                    except subprocess.CalledProcessError as e:
+                        print(f"  [ERROR] attach veth to bridge: {e}",
+                              file=sys.stderr, flush=True)
+                        raise
 
-            try:
-                os.write(sync_ready_w, b"1")
-            except OSError:
-                pass
-            finally:
+            with step("signal child that veth is ready"):
                 try:
-                    os.close(sync_ready_w)
-                except OSError:
-                    pass
+                    os.write(sync_ready_w, b"1")
+                except OSError as e:
+                    print(f"  [ERROR] writing ready signal: {e}",
+                          file=sys.stderr, flush=True)
+                finally:
+                    try:
+                        os.close(sync_ready_w)
+                    except OSError:
+                        pass
         else:
             if sync_unshared_r is not None:
                 try:
@@ -371,9 +412,14 @@ class Isolator:
                 except OSError:
                     pass
 
-        returncode = await proc.wait()
-        self._cleanup_network()
-        self._cleanup_cgroup()
+        with step(f"wait for process pid={proc.pid}"):
+            returncode = await proc.wait()
+
+        with step("cleanup host network"):
+            self._cleanup_network()
+        with step("cleanup cgroup"):
+            self._cleanup_cgroup()
+
         return returncode if returncode is not None else 1
 
     def _preexec_config(
@@ -416,106 +462,128 @@ class Isolator:
         unshared_w: Optional[int] = cfg["unshared_w"]
         ready_r: Optional[int] = cfg["ready_r"]
 
-        try:
-            os.unshare(flags)
-        except OSError as e:
-            print(f"unshare failed: {e}", file=sys.stderr)
-            os._exit(1)
+        with step(f"unshare namespaces (flags=0x{flags:x})"):
+            try:
+                os.unshare(flags)
+            except OSError as e:
+                print(f"unshare failed: {e}", file=sys.stderr, flush=True)
+                os._exit(1)
 
         # PID namespace: only a child of the unsharing process is PID 1
         if cfg["enable_pid"]:
-            pid = os.fork()
-            if pid != 0:
-                # Intermediate process (still old PID ns): wait for real init
-                try:
-                    _, status = os.waitpid(pid, 0)
-                except OSError:
-                    os._exit(1)
-                os._exit(status_to_exitcode(status))
-            # We are now PID 1 inside the new PID namespace
+            with step("fork for PID namespace (child becomes PID 1)"):
+                pid = os.fork()
+                if pid != 0:
+                    # Intermediate process (still old PID ns): wait for real init
+                    try:
+                        _, status = os.waitpid(pid, 0)
+                    except OSError:
+                        os._exit(1)
+                    os._exit(status_to_exitcode(status))
+                # We are now PID 1 inside the new PID namespace
 
         # Tell parent we have entered the new netns (bridge mode)
         if unshared_w is not None:
-            try:
-                os.write(unshared_w, b"1")
-            except OSError:
-                pass
-            try:
-                os.close(unshared_w)
-            except OSError:
-                pass
+            with step("signal parent: netns unshared"):
+                try:
+                    os.write(unshared_w, b"1")
+                except OSError as e:
+                    print(f"  [ERROR] unshare signal write: {e}",
+                          file=sys.stderr, flush=True)
+                try:
+                    os.close(unshared_w)
+                except OSError:
+                    pass
 
         # Wait until parent has moved the veth into this netns
         if ready_r is not None:
-            try:
-                os.read(ready_r, 1)
-            except OSError:
-                pass
-            try:
-                os.close(ready_r)
-            except OSError:
-                pass
+            with step("wait for parent: veth ready"):
+                try:
+                    os.read(ready_r, 1)
+                except OSError as e:
+                    print(f"  [ERROR] ready signal read: {e}",
+                          file=sys.stderr, flush=True)
+                try:
+                    os.close(ready_r)
+                except OSError:
+                    pass
 
         # User mapping (must be early while we can still write the maps)
         if cfg["enable_user"]:
-            self._setup_user_mapping_static(
-                map_root=cfg["map_root"],
-                uid_map=cfg["uid_map"],
-                gid_map=cfg["gid_map"],
-            )
+            with step("setup user/group ID mapping"):
+                self._setup_user_mapping_static(
+                    map_root=cfg["map_root"],
+                    uid_map=cfg["uid_map"],
+                    gid_map=cfg["gid_map"],
+                )
 
         # Private mounts
         if cfg["enable_mount"]:
-            try:
-                mount("none", "/", "", MS_REC | MS_PRIVATE)
-            except OSError:
-                pass
+            with step("make mounts private (MS_REC|MS_PRIVATE)"):
+                try:
+                    mount("none", "/", "", MS_REC | MS_PRIVATE)
+                except OSError:
+                    pass
 
         # Hostname
         if cfg["enable_uts"] and cfg["hostname"]:
-            try:
-                sethostname(cfg["hostname"])
-            except OSError as e:
-                print(f"warning: could not set hostname: {e}", file=sys.stderr)
+            with step(f"set hostname to {cfg['hostname']!r}"):
+                try:
+                    sethostname(cfg["hostname"])
+                except OSError as e:
+                    print(f"warning: could not set hostname: {e}",
+                          file=sys.stderr, flush=True)
+                    raise
 
         # Network inside the netns
         if cfg["enable_net"]:
-            self._setup_container_network_static(
-                net=cfg["net"],
-                veth_cont=cfg["veth_cont"],
-                ip=cfg["ip"],
-                gateway=cfg["gateway"],
-            )
+            with step("setup container network (lo / eth0 / routes)"):
+                self._setup_container_network_static(
+                    net=cfg["net"],
+                    veth_cont=cfg["veth_cont"],
+                    ip=cfg["ip"],
+                    gateway=cfg["gateway"],
+                )
 
         # Rootfs / proc
         if cfg["rootfs"]:
-            self._enter_rootfs_static(cfg["rootfs"])
+            with step(f"enter rootfs {cfg['rootfs']!r}"):
+                self._enter_rootfs_static(cfg["rootfs"])
         elif cfg["enable_mount"]:
-            self._mount_proc_static()
+            with step("mount /proc"):
+                self._mount_proc_static()
 
         if cfg["workdir"]:
-            try:
-                os.chdir(cfg["workdir"])
-            except OSError as e:
-                print(f"warning: cannot chdir to {cfg['workdir']}: {e}",
-                      file=sys.stderr)
+            with step(f"chdir to {cfg['workdir']!r}"):
+                try:
+                    os.chdir(cfg["workdir"])
+                except OSError as e:
+                    print(f"warning: cannot chdir to {cfg['workdir']}: {e}",
+                          file=sys.stderr, flush=True)
+                    raise
 
         # Join cgroup
         if cfg["cgroup_path"]:
-            try:
-                Path(cfg["cgroup_path"], "cgroup.procs").write_text(
-                    str(os.getpid()) + "\n"
-                )
-            except OSError as e:
-                print(f"warning: could not join cgroup: {e}", file=sys.stderr)
+            with step(f"join cgroup {cfg['cgroup_path']}"):
+                try:
+                    Path(cfg["cgroup_path"], "cgroup.procs").write_text(
+                        str(os.getpid()) + "\n"
+                    )
+                except OSError as e:
+                    print(f"warning: could not join cgroup: {e}",
+                          file=sys.stderr, flush=True)
+                    raise
 
         # Optional: stay as reaper (PID 1), let the user command be a child
         if cfg["no_special_pid1"]:
-            self._become_reaper_then_return()
+            with step("become PID-1 reaper (no-special-pid1)"):
+                self._become_reaper_then_return()
             # Only the grandchild returns from preexec_fn and gets exec'd
             return
 
         # Returning from preexec_fn → kernel execs self.command in this process
+        print("→ exec target command (returning from preexec_fn)...",
+              file=sys.stderr, flush=True)
 
     def _become_reaper_then_return(self) -> None:
         """

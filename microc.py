@@ -97,22 +97,26 @@ def child(host_uid, host_gid, config):
     os.execvpe(command[0], command, env)
 
 
+def unshare(config):
+    flags = os.CLONE_NEWUTS | os.CLONE_NEWUSER
+    if config["mount"]:
+        flags |= os.CLONE_NEWNS
+    if config["pid1"]:
+        flags |= os.CLONE_NEWPID
+    os.unshare(flags)
+
+
 def run(config):
     """Run a command in a new namespace."""
     print(" Timestamp     PID     UID:GID      Process Message")
     host_uid = os.getuid()
     host_gid = os.getgid()
-    flags = os.CLONE_NEWUTS | os.CLONE_NEWUSER
     if config["user"] is None:
-        config["user"] = host_gid
+        config["user"] = host_uid
     if config["group"] is None:
         config["group"] = host_gid
-    if config["mount"]:
-        flags |= os.CLONE_NEWNS
-    if config["pid1"]:
-        flags |= os.CLONE_NEWPID
     with out("preparing namespaces"):
-        os.unshare(flags)
+        unshare(config)
     out.pprint(f"{'forking and waiting for child':.<50}[WAIT]")
     if pid := os.fork():
         _, status, resources = os.wait4(pid, 0)
@@ -145,7 +149,7 @@ def main(args=None):
     parser.add_argument("--pid1", action=Bool, default=True)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--envmode", choices=["append", "replace"], default="replace")
-    parser.add_argument("command", nargs="+")
+    parser.add_argument("command", nargs="*")
     opts = parser.parse_args(args=args)
     config = vars(opts)
     config.setdefault("env", {})

@@ -68,9 +68,17 @@ from typing import List, Optional
 
 class step:
     """
-    Context manager that logs the start of a step and then [OK]/[ERROR]
-    with elapsed time in microseconds.
+    Context manager that logs a step on a single stderr line.
+    The start text is padded with '.' so every result marker begins
+    at the same column:
+
+        → prepare cgroup........................ [OK] (812 µs)
+        → unshare namespaces (flags=0x6c020000). [OK] (45 µs)
+        → setup user/group ID mapping........... [ERROR] (12 µs): ...
     """
+
+    # Column where " [OK]" / " [ERROR]" begins (width of the left part)
+    WIDTH = 56
 
     def __init__(self, name: str):
         self.name = name
@@ -78,17 +86,21 @@ class step:
 
     def __enter__(self) -> "step":
         self.t0 = time.perf_counter()
-        print(f"→ {self.name}...", file=sys.stderr, flush=True)
+        head = f"→ {self.name} "
+        # Pad with dots up to WIDTH; always at least one '.'
+        pad = self.WIDTH - len(head)
+        if pad < 1:
+            pad = 1
+        print(head + ("." * pad), file=sys.stderr, end="", flush=True)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         us = int((time.perf_counter() - self.t0) * 1_000_000)
         if exc_type is None:
-            print(f"  [OK] {self.name} ({us} µs)", file=sys.stderr, flush=True)
+            print(f" [OK] ({us} µs)", file=sys.stderr, flush=True)
         else:
             err = exc if exc is not None else exc_type
-            print(f"  [ERROR] {self.name} ({us} µs): {err}",
-                  file=sys.stderr, flush=True)
+            print(f" [ERROR] ({us} µs): {err}", file=sys.stderr, flush=True)
         return False  # never suppress exceptions
 
 

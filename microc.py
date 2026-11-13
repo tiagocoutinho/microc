@@ -8,6 +8,14 @@ import pathlib
 import socket
 import sys
 
+MS_BIND = 0x1000
+MS_REC = 0x4000
+MS_PRIVATE = 0x40000
+MS_RDONLY = 0x1
+MNT_DETACH = 0x2
+MS_NODEV = 0x4
+MS_NOEXEC = 0x8
+
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 
@@ -74,6 +82,7 @@ def prepare(host_uid, host_gid, config):
         with out(f"setting hostname to {host}"):
             socket.sethostname(host)
     if root := config["root"]:
+        mount(str(root), str(root), "", MS_BIND | MS_REC)
         with out(f"changing root"):
             os.chroot(root)
     if pwd := config["pwd"]:
@@ -87,8 +96,7 @@ def child(host_uid, host_gid, config):
     prepare(host_uid, host_gid, config)
     if config["mount"]:
         with out("mounting /proc"):
-            # 1 = READONLY; 4 = NODEV; 8 = NOEXEC
-            mount(None, b"/proc", b"proc", 1 | 4 | 8)
+            mount(None, b"/proc", b"proc", MS_RDONLY | MS_NODEV | MS_NOEXEC)
     out.pprint(f"running {' '.join(command)!r}")
     if config["envmode"] == "replace":
         env = config["env"]
@@ -103,7 +111,8 @@ def unshare(config):
         flags |= os.CLONE_NEWNS
     if config["pid1"]:
         flags |= os.CLONE_NEWPID
-    os.unshare(flags)
+    with out(f"preparing namespaces 0x{flags:x}"):
+        os.unshare(flags)
 
 
 def run(config):
@@ -115,8 +124,7 @@ def run(config):
         config["user"] = host_uid
     if config["group"] is None:
         config["group"] = host_gid
-    with out("preparing namespaces"):
-        unshare(config)
+    unshare(config)
     out.pprint(f"{'forking and waiting for child':.<50}[WAIT]")
     if pid := os.fork():
         _, status, resources = os.wait4(pid, 0)

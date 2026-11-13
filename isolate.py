@@ -1,50 +1,65 @@
 #!/usr/bin/env python3
 """
-isolate.py – Lightweight process isolator using Linux namespaces
+isolate.py – Lightweight process isolator using Linux namespaces + cgroups
 (similar in spirit to a minimal Docker / bubblewrap / unshare wrapper).
+
+Process model (asyncio):
+  - Parent uses asyncio.create_subprocess_exec
+  - Namespace / rootfs / user / cgroup setup runs in preexec_fn (child side)
+  - PID namespace still needs an internal fork after unshare(CLONE_NEWPID)
+    because only a *child* of the unsharing process becomes PID 1
 
 Isolates:
   - PID          (new process tree, child becomes PID 1)
   - User / Group (user namespace + UID/GID mapping)
-  - Network      (new empty network namespace, optional loopback)
+  - Network      (none | host | bridge with veth + IP)
   - Filesystem   (mount namespace + optional chroot / rootfs)
   - Hostname     (UTS namespace)
+  - Resources    (cgroup v2 memory + CPU limits)
 
-Designed so that CPU / memory limits (cgroups v2) can be added later
-without changing the overall structure.
+--no-special-pid1 keeps a PID namespace but runs a tiny reaper as PID 1
+so the command you pass is a normal child (no init signal/reaping semantics).
 
-Requires Linux.  Most features need CAP_SYS_ADMIN (root) or appropriate
-capabilities.  User namespaces can be used for limited rootless operation.
+Requires Linux, root (or sufficient capabilities), and iproute2 (`ip`).
+User namespaces allow limited rootless operation for some features.
 
 Usage examples
 --------------
-  # Simple isolation (new PID + mount + UTS + net, keep host user)
+  # Basic isolation
   sudo python3 isolate.py --hostname mybox -- /bin/bash
 
-  # Run as mapped root inside a rootfs
-  sudo python3 isolate.py --rootfs /path/to/rootfs --map-root --hostname c1 -- /bin/sh
+  # Avoid PID-1 special behaviour (reaper becomes PID 1, command is a child)
+  sudo python3 isolate.py --no-special-pid1 --hostname mybox -- /bin/bash
 
-  # Explicit UID/GID mapping (inside:outside:count)
-  sudo python3 isolate.py --uid-map 0:1000:1 --gid-map 0:1000:1 -- /bin/id
+  # Memory + CPU limits
+  sudo python3 isolate.py --memory 256M --cpu 50% --hostname limited -- /bin/bash
 
-  # Keep host network
-  sudo python3 isolate.py --net host -- /bin/bash
+  # Bridge networking with static IP
+  sudo python3 isolate.py --net bridge --ip 10.200.0.2/24 --gateway 10.200.0.1 \\
+      --hostname netbox -- /bin/bash
 
-  # Disable some namespaces
-  sudo python3 isolate.py --no-pid --no-net --hostname only-hostname -- /bin/bash
+  # Full example with rootfs
+  sudo python3 isolate.py --rootfs /path/to/rootfs --map-root \\
+      --net bridge --ip 10.200.0.10/24 --gateway 10.200.0.1 \\
+      --memory 512M --cpu 100% --hostname c1 -- /bin/sh
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-import signal
+import asyncio
 import ctypes
 import ctypes.util
 import errno
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +115,77 @@ def sethostname(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Namespace / isolation logic
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def parse_size(s: str) -> str:
+    """Human size → cgroup v2 memory.max value (bytes or 'max')."""
+    s = s.strip().lower()
+    if s == "max":
+        return "max"
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]i?b?)?", s)
+    if not m:
+        raise ValueError(f"invalid size: {s}")
+    num = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    mult = {
+        "": 1,
+        "k": 1024, "kb": 1024, "ki": 1024, "kib": 1024,
+        "m": 1024**2, "mb": 1024**2, "mi": 1024**2, "mib": 1024**2,
+        "g": 1024**3, "gb": 1024**3, "gi": 1024**3, "gib": 1024**3,
+        "t": 1024**4, "tb": 1024**4, "ti": 1024**4, "tib": 1024**4,
+    }.get(unit)
+    if mult is None:
+        raise ValueError(f"unknown unit in size: {s}")
+    return str(int(num * mult))
+
+
+def parse_cpu_quota(s: str, period_us: int = 100_000) -> str:
+    """Percentage or raw quota → cgroup v2 'quota period' string."""
+    s = s.strip().lower()
+    if s == "max":
+        return f"max {period_us}"
+    if re.fullmatch(r"\d+\s+\d+", s):
+        return s
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*%?", s)
+    if not m:
+        raise ValueError(f"invalid cpu quota: {s}")
+    pct = float(m.group(1))
+    quota = max(1000, int(period_us * pct / 100.0))
+    return f"{quota} {period_us}"
+
+
+def run_ip(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ip", *args],
+        check=check,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def ensure_bridge(name: str, gateway_cidr: Optional[str] = None) -> None:
+    r = run_ip("link", "show", name, check=False)
+    if r.returncode != 0:
+        run_ip("link", "add", name, "type", "bridge")
+        run_ip("link", "set", name, "up")
+        if gateway_cidr:
+            run_ip("addr", "add", gateway_cidr, "dev", name, check=False)
+    else:
+        run_ip("link", "set", name, "up", check=False)
+
+
+def status_to_exitcode(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Isolator
 # ---------------------------------------------------------------------------
 
 class Isolator:
@@ -114,16 +199,20 @@ class Isolator:
         uid_map: Optional[str] = None,
         gid_map: Optional[str] = None,
         map_root: bool = False,
-        net: str = "none",          # "none" | "host"
+        net: str = "none",
+        ip: Optional[str] = None,
+        gateway: Optional[str] = None,
+        bridge: str = "isolate0",
         enable_pid: bool = True,
         enable_user: bool = True,
         enable_mount: bool = True,
         enable_uts: bool = True,
         enable_ipc: bool = True,
         enable_net: bool = True,
-        # Future extension points for cgroups
-        memory_limit: Optional[str] = None,   # e.g. "512M"
-        cpu_quota: Optional[str] = None,      # e.g. "50%" or "50000 100000"
+        no_special_pid1: bool = False,
+        memory_limit: Optional[str] = None,
+        memory_swap: Optional[str] = None,
+        cpu_quota: Optional[str] = None,
         cgroup_parent: str = "/sys/fs/cgroup",
     ):
         self.command = command
@@ -134,28 +223,54 @@ class Isolator:
         self.gid_map = gid_map
         self.map_root = map_root
         self.net = net
+        self.ip = ip
+        self.gateway = gateway
+        self.bridge = bridge
         self.enable_pid = enable_pid
         self.enable_user = enable_user
         self.enable_mount = enable_mount
         self.enable_uts = enable_uts
         self.enable_ipc = enable_ipc
         self.enable_net = enable_net and (net != "host")
+        self.no_special_pid1 = bool(no_special_pid1 and enable_pid)
         self.memory_limit = memory_limit
+        self.memory_swap = memory_swap
         self.cpu_quota = cpu_quota
         self.cgroup_parent = cgroup_parent
 
         self._cgroup_path: Optional[Path] = None
+        self._veth_host: Optional[str] = None
+        self._veth_cont: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Public entry
+    # Public entry (asyncio)
     # ------------------------------------------------------------------
 
     def run(self) -> int:
         if not sys.platform.startswith("linux"):
             print("This tool only works on Linux (namespaces).", file=sys.stderr)
             return 1
+        return asyncio.run(self._run_async())
 
-        # Build the set of namespaces we will unshare
+    async def _run_async(self) -> int:
+        self._prepare_cgroup()
+
+        if self.net == "bridge" and self.enable_net:
+            self._prepare_host_network()
+
+        # Sync pipes for bridge mode: child → parent "unshared", parent → child "ready"
+        sync_unshared_r = sync_unshared_w = None
+        sync_ready_r = sync_ready_w = None
+        pass_fds: List[int] = []
+
+        if self.net == "bridge" and self.enable_net:
+            sync_unshared_r, sync_unshared_w = os.pipe()
+            sync_ready_r, sync_ready_w = os.pipe()
+            # Child keeps write end of unshared + read end of ready
+            pass_fds = [sync_unshared_w, sync_ready_r]
+            os.set_inheritable(sync_unshared_w, True)
+            os.set_inheritable(sync_ready_r, True)
+
         flags = 0
         if self.enable_mount:
             flags |= CLONE_NEWNS
@@ -170,278 +285,515 @@ class Isolator:
         if self.enable_net:
             flags |= CLONE_NEWNET
 
-        # ------------------------------------------------------------------
-        # 1. Optionally create a cgroup for future resource limits
-        #    (placeholder – will be fully wired later)
-        # ------------------------------------------------------------------
-        self._prepare_cgroup()
+        # Capture config for the preexec closure (must be picklable / simple)
+        cfg = self._preexec_config(
+            flags=flags,
+            unshared_w=sync_unshared_w,
+            ready_r=sync_ready_r,
+        )
 
-        # ------------------------------------------------------------------
-        # 2. Fork + unshare
-        #    Important: for PID namespace the *child* becomes PID 1.
-        # ------------------------------------------------------------------
-        # We unshare everything except PID in the parent, then fork,
-        # then the child finishes PID-related setup.  Alternatively we
-        # can unshare all flags and then fork immediately.
-        # The classic pattern is:
-        #   unshare(CLONE_NEWPID | ...)  →  fork  →  child is PID 1
+        def preexec() -> None:
+            self._preexec_fn(cfg)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.command,
+                preexec_fn=preexec,
+                pass_fds=tuple(pass_fds) if pass_fds else (),
+                start_new_session=True,
+            )
+        except OSError as e:
+            print(f"failed to start process: {e}", file=sys.stderr)
+            self._cleanup_network()
+            self._cleanup_cgroup()
+            return 1
+        finally:
+            # Parent closes the ends it does not need
+            if sync_unshared_w is not None:
+                try:
+                    os.close(sync_unshared_w)
+                except OSError:
+                    pass
+            if sync_ready_r is not None:
+                try:
+                    os.close(sync_ready_r)
+                except OSError:
+                    pass
+
+        # Bridge: wait for child to enter netns, move veth, signal ready
+        if self.net == "bridge" and self.enable_net and proc.pid:
+            try:
+                # Block until child signals unshare done
+                await asyncio.get_event_loop().run_in_executor(
+                    None, os.read, sync_unshared_r, 1
+                )
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(sync_unshared_r)
+                except OSError:
+                    pass
+
+            if self._veth_cont:
+                try:
+                    run_ip("link", "set", self._veth_cont, "netns", str(proc.pid))
+                except subprocess.CalledProcessError as e:
+                    print(f"warning: could not move veth into netns: {e}",
+                          file=sys.stderr)
+
+            if self._veth_host:
+                try:
+                    run_ip("link", "set", self._veth_host, "master", self.bridge)
+                    run_ip("link", "set", self._veth_host, "up")
+                except subprocess.CalledProcessError as e:
+                    print(f"warning: could not attach veth to bridge: {e}",
+                          file=sys.stderr)
+
+            try:
+                os.write(sync_ready_w, b"1")
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(sync_ready_w)
+                except OSError:
+                    pass
+        else:
+            if sync_unshared_r is not None:
+                try:
+                    os.close(sync_unshared_r)
+                except OSError:
+                    pass
+            if sync_ready_w is not None:
+                try:
+                    os.close(sync_ready_w)
+                except OSError:
+                    pass
+
+        returncode = await proc.wait()
+        self._cleanup_network()
+        self._cleanup_cgroup()
+        return returncode if returncode is not None else 1
+
+    def _preexec_config(
+        self,
+        *,
+        flags: int,
+        unshared_w: Optional[int],
+        ready_r: Optional[int],
+    ) -> dict:
+        """Snapshot of settings used inside preexec_fn."""
+        return {
+            "flags": flags,
+            "enable_pid": self.enable_pid,
+            "enable_user": self.enable_user,
+            "enable_mount": self.enable_mount,
+            "enable_uts": self.enable_uts,
+            "enable_net": self.enable_net,
+            "no_special_pid1": self.no_special_pid1,
+            "hostname": self.hostname,
+            "rootfs": str(self.rootfs) if self.rootfs else None,
+            "workdir": self.workdir,
+            "map_root": self.map_root,
+            "uid_map": self.uid_map,
+            "gid_map": self.gid_map,
+            "net": self.net,
+            "ip": self.ip,
+            "gateway": self.gateway,
+            "veth_cont": self._veth_cont,
+            "cgroup_path": str(self._cgroup_path) if self._cgroup_path else None,
+            "unshared_w": unshared_w,
+            "ready_r": ready_r,
+        }
+
+    # ------------------------------------------------------------------
+    # Runs in the subprocess child, before exec
+    # ------------------------------------------------------------------
+
+    def _preexec_fn(self, cfg: dict) -> None:
+        flags: int = cfg["flags"]
+        unshared_w: Optional[int] = cfg["unshared_w"]
+        ready_r: Optional[int] = cfg["ready_r"]
+
         try:
             os.unshare(flags)
         except OSError as e:
             print(f"unshare failed: {e}", file=sys.stderr)
-            print("Hint: most namespace operations require root or CAP_SYS_ADMIN.",
-                  file=sys.stderr)
-            return 1
+            os._exit(1)
 
-        # After unshare(CLONE_NEWPID) the *current* process is still in the
-        # old PID namespace.  The first child we create will be PID 1 in the
-        # new one.
-        if self.enable_pid:
+        # PID namespace: only a child of the unsharing process is PID 1
+        if cfg["enable_pid"]:
             pid = os.fork()
             if pid != 0:
-                # Parent: wait for the isolated child and propagate exit status
-                _, status = os.waitpid(pid, 0)
-                self._cleanup_cgroup()
-                if os.WIFEXITED(status):
-                    return os.WEXITSTATUS(status)
-                if os.WIFSIGNALED(status):
-                    return 128 + os.WTERMSIG(status)
-                return 1
-            # Child continues – it is now PID 1 inside the new PID ns
+                # Intermediate process (still old PID ns): wait for real init
+                try:
+                    _, status = os.waitpid(pid, 0)
+                except OSError:
+                    os._exit(1)
+                os._exit(status_to_exitcode(status))
+            # We are now PID 1 inside the new PID namespace
 
-        # ------------------------------------------------------------------
-        # 3. User namespace mapping (must be done early, while we still can)
-        # ------------------------------------------------------------------
-        if self.enable_user:
-            self._setup_user_mapping()
+        # Tell parent we have entered the new netns (bridge mode)
+        if unshared_w is not None:
+            try:
+                os.write(unshared_w, b"1")
+            except OSError:
+                pass
+            try:
+                os.close(unshared_w)
+            except OSError:
+                pass
 
-        # ------------------------------------------------------------------
-        # 4. Mount namespace housekeeping
-        # ------------------------------------------------------------------
-        if self.enable_mount:
-            # Make mounts private so they don't leak to the host
+        # Wait until parent has moved the veth into this netns
+        if ready_r is not None:
+            try:
+                os.read(ready_r, 1)
+            except OSError:
+                pass
+            try:
+                os.close(ready_r)
+            except OSError:
+                pass
+
+        # User mapping (must be early while we can still write the maps)
+        if cfg["enable_user"]:
+            self._setup_user_mapping_static(
+                map_root=cfg["map_root"],
+                uid_map=cfg["uid_map"],
+                gid_map=cfg["gid_map"],
+            )
+
+        # Private mounts
+        if cfg["enable_mount"]:
             try:
                 mount("none", "/", "", MS_REC | MS_PRIVATE)
             except OSError:
-                # Some kernels / contexts already have it private
                 pass
 
-        # ------------------------------------------------------------------
-        # 5. Hostname
-        # ------------------------------------------------------------------
-        if self.enable_uts and self.hostname:
+        # Hostname
+        if cfg["enable_uts"] and cfg["hostname"]:
             try:
-                sethostname(self.hostname)
+                sethostname(cfg["hostname"])
             except OSError as e:
                 print(f"warning: could not set hostname: {e}", file=sys.stderr)
 
-        # ------------------------------------------------------------------
-        # 6. Network (minimal – just bring loopback up)
-        # ------------------------------------------------------------------
-        if self.enable_net:
-            self._setup_network()
+        # Network inside the netns
+        if cfg["enable_net"]:
+            self._setup_container_network_static(
+                net=cfg["net"],
+                veth_cont=cfg["veth_cont"],
+                ip=cfg["ip"],
+                gateway=cfg["gateway"],
+            )
 
-        # ------------------------------------------------------------------
-        # 7. Filesystem / rootfs
-        # ------------------------------------------------------------------
-        if self.rootfs:
-            self._enter_rootfs()
-        elif self.enable_mount:
-            # Even without a full rootfs we can still isolate /proc
-            self._mount_proc()
+        # Rootfs / proc
+        if cfg["rootfs"]:
+            self._enter_rootfs_static(cfg["rootfs"])
+        elif cfg["enable_mount"]:
+            self._mount_proc_static()
 
-        # ------------------------------------------------------------------
-        # 8. Working directory
-        # ------------------------------------------------------------------
-        if self.workdir:
+        if cfg["workdir"]:
             try:
-                os.chdir(self.workdir)
+                os.chdir(cfg["workdir"])
             except OSError as e:
-                print(f"warning: cannot chdir to {self.workdir}: {e}",
+                print(f"warning: cannot chdir to {cfg['workdir']}: {e}",
                       file=sys.stderr)
 
-        # ------------------------------------------------------------------
-        # 9. Move ourselves into the prepared cgroup (if any)
-        # ------------------------------------------------------------------
-        self._join_cgroup()
+        # Join cgroup
+        if cfg["cgroup_path"]:
+            try:
+                Path(cfg["cgroup_path"], "cgroup.procs").write_text(
+                    str(os.getpid()) + "\n"
+                )
+            except OSError as e:
+                print(f"warning: could not join cgroup: {e}", file=sys.stderr)
 
-        # ------------------------------------------------------------------
-        # 10. Exec the target command
-        # ------------------------------------------------------------------
-        try:
-            os.execvp(self.command[0], self.command)
-        except OSError as e:
-            print(f"exec failed: {e}", file=sys.stderr)
-            return 127
+        # Optional: stay as reaper (PID 1), let the user command be a child
+        if cfg["no_special_pid1"]:
+            self._become_reaper_then_return()
+            # Only the grandchild returns from preexec_fn and gets exec'd
+            return
 
-        return 0  # never reached
+        # Returning from preexec_fn → kernel execs self.command in this process
+
+    def _become_reaper_then_return(self) -> None:
+        """
+        Fork once more.  This process (PID 1) becomes a signal-forwarding
+        reaper and never returns.  The child returns from preexec_fn so
+        create_subprocess_exec will exec the user command into it.
+        """
+        child_pid = os.fork()
+        if child_pid != 0:
+            # PID 1 reaper — never return to preexec / exec
+            os._exit(self._run_as_init(child_pid))
+        # Child returns → will be replaced by the target command
+
+    def _run_as_init(self, main_child: int) -> int:
+        forward = {
+            signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
+            signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2,
+        }
+
+        def _forward(signum, frame):
+            try:
+                os.kill(main_child, signum)
+            except OSError:
+                pass
+
+        for sig in forward:
+            try:
+                signal.signal(sig, _forward)
+            except (OSError, ValueError):
+                pass
+
+        exit_code = 0
+        while True:
+            try:
+                pid, status = os.waitpid(-1, 0)
+            except ChildProcessError:
+                break
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                break
+
+            if pid == main_child:
+                exit_code = status_to_exitcode(status)
+                while True:
+                    try:
+                        os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    except OSError:
+                        break
+                break
+
+        return exit_code
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Static helpers usable from preexec (no self mutation)
     # ------------------------------------------------------------------
 
-    def _setup_user_mapping(self) -> None:
-        """Write uid_map / gid_map.  Must be done before we drop privileges."""
-        # Deny setgroups so we can write the maps as non-root (when using
-        # user namespaces from an unprivileged process).
+    @staticmethod
+    def _setup_user_mapping_static(
+        *,
+        map_root: bool,
+        uid_map: Optional[str],
+        gid_map: Optional[str],
+    ) -> None:
         try:
             with open("/proc/self/setgroups", "w") as f:
                 f.write("deny\n")
         except (FileNotFoundError, PermissionError, OSError):
             pass
 
-        uid = os.getuid()
-        gid = os.getgid()
-
-        if self.map_root:
-            # Map host uid/gid → 0 inside
-            uid_map = f"0 {uid} 1"
-            gid_map = f"0 {gid} 1"
+        uid, gid = os.getuid(), os.getgid()
+        if map_root:
+            umap, gmap = f"0 {uid} 1", f"0 {gid} 1"
         else:
-            uid_map = self.uid_map or f"0 {uid} 1"
-            gid_map = self.gid_map or f"0 {gid} 1"
+            umap = uid_map or f"0 {uid} 1"
+            gmap = gid_map or f"0 {gid} 1"
 
         try:
             with open("/proc/self/uid_map", "w") as f:
-                f.write(uid_map + "\n")
+                f.write(umap + "\n")
             with open("/proc/self/gid_map", "w") as f:
-                f.write(gid_map + "\n")
+                f.write(gmap + "\n")
         except OSError as e:
             print(f"warning: could not write user maps: {e}", file=sys.stderr)
-            print("  (user namespace mapping may be incomplete)", file=sys.stderr)
 
-    def _setup_network(self) -> None:
-        """Bring up the loopback interface inside the new netns."""
-        # We use the ip command if available; pure netlink would be better
-        # but adds complexity.  For a pure-Python version one can later
-        # replace this with pyroute2 or raw netlink.
+    @staticmethod
+    def _setup_container_network_static(
+        *,
+        net: str,
+        veth_cont: Optional[str],
+        ip: Optional[str],
+        gateway: Optional[str],
+    ) -> None:
         try:
-            import subprocess
-            subprocess.run(["ip", "link", "set", "lo", "up"],
-                           check=False, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
-            # ip not present – network isolation still works, just no lo
+            run_ip("link", "set", "lo", "up")
+        except (FileNotFoundError, subprocess.CalledProcessError):
             pass
 
-    def _mount_proc(self) -> None:
-        """Mount a fresh /proc (required for a correct view inside PID ns)."""
+        if net != "bridge" or not veth_cont:
+            return
+
+        for _ in range(40):
+            r = run_ip("link", "show", veth_cont, check=False)
+            if r.returncode == 0:
+                break
+            time.sleep(0.025)
+        else:
+            print(f"warning: container veth {veth_cont} not visible",
+                  file=sys.stderr)
+            return
+
+        try:
+            run_ip("link", "set", veth_cont, "name", "eth0")
+            run_ip("link", "set", "eth0", "up")
+            if ip:
+                run_ip("addr", "add", ip, "dev", "eth0")
+            if gateway:
+                run_ip("route", "add", "default", "via", gateway, check=False)
+        except subprocess.CalledProcessError as e:
+            print(f"warning: container network setup failed: {e}",
+                  file=sys.stderr)
+
+    @staticmethod
+    def _mount_proc_static() -> None:
         try:
             os.makedirs("/proc", exist_ok=True)
             mount("proc", "/proc", "proc", 0)
         except OSError as e:
-            # May fail if we are not root / no CAP_SYS_ADMIN
             print(f"warning: could not mount /proc: {e}", file=sys.stderr)
 
-    def _enter_rootfs(self) -> None:
-        """Chroot or pivot_root into the supplied rootfs."""
-        if not self.rootfs or not self.rootfs.is_dir():
-            raise RuntimeError(f"rootfs does not exist or is not a directory: {self.rootfs}")
+    @staticmethod
+    def _enter_rootfs_static(rootfs: str) -> None:
+        root = Path(rootfs)
+        if not root.is_dir():
+            print(f"rootfs is not a directory: {rootfs}", file=sys.stderr)
+            os._exit(1)
 
-        # Make sure we have a place for the old root
-        old_root = self.rootfs / "old_root"
+        old_root = root / "old_root"
         try:
             old_root.mkdir(exist_ok=True)
         except OSError:
-            # Fallback to plain chroot if we cannot prepare pivot
-            os.chroot(str(self.rootfs))
+            os.chroot(str(root))
             os.chdir("/")
-            self._mount_proc()
+            Isolator._mount_proc_static()
             return
 
-        # Preferred modern approach: pivot_root
         try:
-            # Bind-mount the rootfs onto itself so it becomes a mount point
-            mount(str(self.rootfs), str(self.rootfs), "", MS_BIND | MS_REC)
-            pivot_root(str(self.rootfs), str(old_root))
+            mount(str(root), str(root), "", MS_BIND | MS_REC)
+            pivot_root(str(root), str(old_root))
             os.chdir("/")
-            # Unmount the old root (now visible as /old_root)
             try:
                 umount("/old_root", MNT_DETACH)
                 os.rmdir("/old_root")
             except OSError:
                 pass
         except OSError:
-            # Fallback
-            os.chroot(str(self.rootfs))
+            os.chroot(str(root))
             os.chdir("/")
 
-        self._mount_proc()
-
-        # Minimal /dev (optional – many programs need at least null, zero, …)
+        Isolator._mount_proc_static()
         try:
             os.makedirs("/dev", exist_ok=True)
-            # You can add more device nodes or a tmpfs + mknod here
         except OSError:
             pass
 
     # ------------------------------------------------------------------
-    # Cgroup placeholders (ready for the next iteration)
+    # Host-side network + cgroup
     # ------------------------------------------------------------------
 
+    def _prepare_host_network(self) -> None:
+        suffix = uuid.uuid4().hex[:8]
+        self._veth_host = f"vethh{suffix}"
+        self._veth_cont = f"vethc{suffix}"
+
+        if not self.ip:
+            self.ip = "10.200.0.2/24"
+        if not self.gateway:
+            self.gateway = "10.200.0.1"
+
+        bridge_cidr = None
+        if self.gateway and self.ip and "/" in self.ip:
+            bridge_cidr = f"{self.gateway}/{self.ip.split('/')[1]}"
+
+        try:
+            ensure_bridge(self.bridge, bridge_cidr)
+            run_ip(
+                "link", "add", self._veth_host, "type", "veth",
+                "peer", "name", self._veth_cont,
+            )
+            run_ip("link", "set", self._veth_host, "up", check=False)
+        except subprocess.CalledProcessError as e:
+            print(f"error preparing host network: {e}", file=sys.stderr)
+            raise
+
+    def _cleanup_network(self) -> None:
+        if self._veth_host:
+            try:
+                run_ip("link", "delete", self._veth_host, check=False)
+            except Exception:
+                pass
+
     def _prepare_cgroup(self) -> None:
-        """
-        Create a dedicated cgroup for this process tree.
-        Currently only prepares the directory; actual limits are applied
-        when --memory / --cpu options are added.
-        """
-        if not (self.memory_limit or self.cpu_quota):
+        if not (self.memory_limit or self.memory_swap or self.cpu_quota):
             return
 
-        # Example layout that will be used later:
-        #   /sys/fs/cgroup/isolate/<random-or-pid>
         try:
             base = Path(self.cgroup_parent)
             if not (base / "cgroup.controllers").exists():
-                # Not a pure cgroup-v2 hierarchy
+                print("warning: cgroup v2 hierarchy not found, "
+                      "resource limits disabled", file=sys.stderr)
                 return
 
-            name = f"isolate-{os.getpid()}"
-            path = base / name
-            path.mkdir(exist_ok=True)
-            self._cgroup_path = path
+            isolate_base = base / "isolate"
+            isolate_base.mkdir(exist_ok=True)
 
-            # Enable controllers we care about
-            controllers = path.parent / "cgroup.subtree_control"
-            if controllers.exists():
-                # Best-effort; may already be enabled higher up
+            for ctrl_file in (
+                base / "cgroup.subtree_control",
+                isolate_base / "cgroup.subtree_control",
+            ):
+                if not ctrl_file.exists():
+                    continue
                 try:
-                    with open(controllers, "a") as f:
-                        f.write("+memory +cpu\n")
+                    current = ctrl_file.read_text().strip().split()
+                    needed = []
+                    if (self.memory_limit or self.memory_swap) and "memory" not in current:
+                        needed.append("+memory")
+                    if self.cpu_quota and "cpu" not in current:
+                        needed.append("+cpu")
+                    if needed:
+                        ctrl_file.write_text(" ".join(needed) + "\n")
                 except OSError:
                     pass
 
-            # Apply limits when the options are present
+            name = f"iso-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+            path = isolate_base / name
+            path.mkdir(exist_ok=True)
+            self._cgroup_path = path
+
             if self.memory_limit:
-                # Accept human-readable values later; for now expect bytes or "max"
-                limit_file = path / "memory.max"
-                if limit_file.exists():
-                    limit_file.write_text(self.memory_limit + "\n")
+                try:
+                    (path / "memory.max").write_text(
+                        parse_size(self.memory_limit) + "\n"
+                    )
+                except (ValueError, OSError) as e:
+                    print(f"warning: could not set memory.max: {e}",
+                          file=sys.stderr)
+
+            if self.memory_swap:
+                try:
+                    swap_file = path / "memory.swap.max"
+                    if swap_file.exists():
+                        swap_file.write_text(
+                            parse_size(self.memory_swap) + "\n"
+                        )
+                except (ValueError, OSError) as e:
+                    print(f"warning: could not set memory.swap.max: {e}",
+                          file=sys.stderr)
 
             if self.cpu_quota:
-                # Format: "quota period"  (both in µs) or a percentage string
-                cpu_file = path / "cpu.max"
-                if cpu_file.exists():
-                    cpu_file.write_text(self.cpu_quota + "\n")
+                try:
+                    (path / "cpu.max").write_text(
+                        parse_cpu_quota(self.cpu_quota) + "\n"
+                    )
+                except (ValueError, OSError) as e:
+                    print(f"warning: could not set cpu.max: {e}",
+                          file=sys.stderr)
 
         except OSError as e:
             print(f"warning: cgroup setup failed: {e}", file=sys.stderr)
             self._cgroup_path = None
 
-    def _join_cgroup(self) -> None:
-        if not self._cgroup_path:
-            return
-        try:
-            procs = self._cgroup_path / "cgroup.procs"
-            procs.write_text(str(os.getpid()) + "\n")
-        except OSError as e:
-            print(f"warning: could not join cgroup: {e}", file=sys.stderr)
-
     def _cleanup_cgroup(self) -> None:
         if not self._cgroup_path:
             return
         try:
-            # After the child has exited the cgroup should be empty
+            time.sleep(0.02)
             self._cgroup_path.rmdir()
         except OSError:
             pass
@@ -454,7 +806,8 @@ class Isolator:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run a command inside isolated Linux namespaces "
-                    "(PID, user, network, mount, UTS).",
+                    "with optional cgroup resource limits and bridge networking "
+                    "(asyncio + create_subprocess_exec).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -467,23 +820,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--workdir", "-w",
                    help="Working directory inside the isolated environment")
 
-    # User / group
     p.add_argument("--map-root", action="store_true",
                    help="Map the invoking user to UID/GID 0 inside the user namespace")
     p.add_argument("--uid-map",
-                   help="UID mapping string 'inside:outside:count' "
-                        "(default: 0:<current-uid>:1 when --map-root is used)")
+                   help="UID mapping string 'inside:outside:count'")
     p.add_argument("--gid-map",
                    help="GID mapping string 'inside:outside:count'")
 
-    # Network
-    p.add_argument("--net", choices=["none", "host"], default="none",
-                   help="Network mode: 'none' = new empty netns, "
-                        "'host' = share host network (default: none)")
+    p.add_argument("--net", choices=["none", "host", "bridge"], default="none",
+                   help="Network mode: none | host | bridge (default: none)")
+    p.add_argument("--ip",
+                   help="Container IP/CIDR for --net bridge (default: 10.200.0.2/24)")
+    p.add_argument("--gateway",
+                   help="Default gateway for --net bridge (default: 10.200.0.1)")
+    p.add_argument("--bridge", default="isolate0",
+                   help="Bridge name for host-side veth (default: isolate0)")
 
-    # Toggle individual namespaces
     p.add_argument("--no-pid", action="store_true",
                    help="Do not create a new PID namespace")
+    p.add_argument("--no-special-pid1", action="store_true",
+                   help="Keep a PID namespace but run a tiny reaper as PID 1 "
+                        "so the command is a normal child. Ignored with --no-pid.")
     p.add_argument("--no-user", action="store_true",
                    help="Do not create a new user namespace")
     p.add_argument("--no-mount", action="store_true",
@@ -493,27 +850,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-ipc", action="store_true",
                    help="Do not create a new IPC namespace")
     p.add_argument("--no-net", action="store_true",
-                   help="Do not create a new network namespace "
-                        "(overrides --net)")
+                   help="Do not create a new network namespace (overrides --net)")
 
-    # Future resource limits (already accepted so the CLI stays stable)
     p.add_argument("--memory",
-                   help="Memory limit for the cgroup (e.g. 512M, 1G). "
-                        "Requires cgroup v2.  (placeholder for next version)")
+                   help="Hard memory limit (e.g. 256M, 1G). Requires cgroup v2.")
+    p.add_argument("--memory-swap",
+                   help="Swap limit (e.g. 0, 512M). Requires cgroup v2.")
     p.add_argument("--cpu",
-                   help="CPU quota (e.g. '50000 100000' for 50%% of one core, "
-                        "or a percentage).  Requires cgroup v2.  "
-                        "(placeholder for next version)")
+                   help="CPU quota: percentage (50%%, 200%%) or raw "
+                        "'quota period' in microseconds. Requires cgroup v2.")
 
     p.add_argument("command", nargs=argparse.REMAINDER,
                    help="Command and arguments to run (use -- to separate)")
 
     args = p.parse_args(argv)
 
-    # Clean the classic "--" separator
     if args.command and args.command[0] == "--":
         args.command = args.command[1:]
-
     if not args.command:
         p.error("a command to execute is required")
 
@@ -522,7 +875,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-
     isolator = Isolator(
         command=args.command,
         hostname=args.hostname,
@@ -532,13 +884,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         gid_map=args.gid_map,
         map_root=args.map_root,
         net=args.net,
+        ip=args.ip,
+        gateway=args.gateway,
+        bridge=args.bridge,
         enable_pid=not args.no_pid,
         enable_user=not args.no_user,
         enable_mount=not args.no_mount,
         enable_uts=not args.no_uts,
         enable_ipc=not args.no_ipc,
         enable_net=not args.no_net,
+        no_special_pid1=args.no_special_pid1,
         memory_limit=args.memory,
+        memory_swap=args.memory_swap,
         cpu_quota=args.cpu,
     )
     return isolator.run()
